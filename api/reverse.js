@@ -3,8 +3,6 @@ import path from "path";
 import { point, featureCollection } from "@turf/helpers";
 import nearestPoint from "@turf/nearest-point";
 
-// GeoJSON nur einmal einlesen und im Modul-Scope cachen,
-// damit nicht bei jedem Request die (potentiell große) Datei neu geparst wird.
 let germanyFC = null;
 
 function loadData() {
