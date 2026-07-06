@@ -145,7 +145,7 @@ export default async function handler(req, res) {
       return populationOf(b.properties) - populationOf(a.properties);
     });
 
-    // Polygon-Namen, die schon über einen (wichtigeren) Point abgedeckt sind, ausschließen
+
     const matchedNames = new Set(
       pointMatches.map((f) => normalize(f.properties.name))
     );
