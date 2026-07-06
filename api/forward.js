@@ -2,7 +2,9 @@ import fs from "fs";
 import path from "path";
 import pointOnFeature from "@turf/point-on-feature";
 import booleanPointInPolygon from "@turf/boolean-point-in-polygon";
+import bbox from "@turf/bbox";
 import { point } from "@turf/helpers";
+import RBush from "rbush";
 
 const BUNDESLAND_MAP = {
   "01": "Schleswig-Holstein",
@@ -23,8 +25,6 @@ const BUNDESLAND_MAP = {
   "16": "Thüringen",
 };
 
-// Wichtigkeit von OSM "place"-Tags, um bei mehreren gleichnamigen Treffern
-// den richtigen (z.B. die Großstadt statt einen Weiler) zu bevorzugen.
 const PLACE_RANK = {
   city: 7,
   town: 6,
@@ -45,67 +45,90 @@ function populationOf(props) {
   return Number.isNaN(n) ? 0 : n;
 }
 
-// Getrennte Caches für Points (echte Ortsmittelpunkte) und Polygone (Gemeindegrenzen)
+function normalize(str) {
+  return str
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+// Caches: Point-/Polygon-Features (mit vorab normalisiertem Namen)
+// + RBush-Index über die Polygon-BBoxen für schnelle Bundesland-Lookups
 let pointFeatures = null;
 let polygonFeatures = null;
+let polygonIndex = null;
+let polygonItems = null;
 
 function loadData() {
   if (pointFeatures && polygonFeatures) {
-    return { pointFeatures, polygonFeatures };
+    return { pointFeatures, polygonFeatures, polygonIndex, polygonItems };
   }
 
   const filePath = path.join(process.cwd(), "data", "deutschland.geojson");
   const raw = fs.readFileSync(filePath, "utf-8");
   const parsed = JSON.parse(raw);
 
-  pointFeatures = parsed.features.filter(
-    (f) => f.geometry && f.geometry.type === "Point" && f.properties?.name
-  );
+  pointFeatures = parsed.features
+    .filter(
+      (f) => f.geometry && f.geometry.type === "Point" && f.properties?.name
+    )
+    // normalisierten Namen einmalig berechnen statt bei jedem Request
+    .map((f) => {
+      f._normalizedName = normalize(f.properties.name);
+      return f;
+    });
 
-  polygonFeatures = parsed.features.filter(
-    (f) =>
-      f.geometry &&
-      (f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon") &&
-      f.properties?.name
-  );
+  polygonFeatures = parsed.features
+    .filter(
+      (f) =>
+        f.geometry &&
+        (f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon") &&
+        f.properties?.name
+    )
+    .map((f) => {
+      f._normalizedName = normalize(f.properties.name);
+      return f;
+    });
 
-  return { pointFeatures, polygonFeatures };
-}
+  // RBush-Index für schnelle Point-in-Polygon-Kandidatensuche
+  polygonItems = polygonFeatures.map((feature) => {
+    const [minX, minY, maxX, maxY] = bbox(feature);
+    return { minX, minY, maxX, maxY, feature };
+  });
+  polygonIndex = new RBush();
+  polygonIndex.load(polygonItems);
 
-function normalize(str) {
-  return str
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, ""); // Umlaute/Akzente für Vergleich entfernen
+  return { pointFeatures, polygonFeatures, polygonIndex, polygonItems };
 }
 
 function findMatches(features, normalizedQuery) {
-  // 1. Exakte Treffer (normalisiert)
-  let matches = features.filter(
-    (f) => normalize(f.properties.name) === normalizedQuery
-  );
-  // 2. "beginnt mit"
+  // Nutzt jetzt f._normalizedName (vorberechnet) statt normalize(f.properties.name)
+  let matches = features.filter((f) => f._normalizedName === normalizedQuery);
   if (matches.length === 0) {
     matches = features.filter((f) =>
-      normalize(f.properties.name).startsWith(normalizedQuery)
+      f._normalizedName.startsWith(normalizedQuery)
     );
   }
-  // 3. "enthält"
   if (matches.length === 0) {
     matches = features.filter((f) =>
-      normalize(f.properties.name).includes(normalizedQuery)
+      f._normalizedName.includes(normalizedQuery)
     );
   }
   return matches;
 }
 
-// Findet das Bundesland eines Punkts per Point-in-Polygon-Check gegen die
-// Gemeindegrenzen (nötig, da OSM-Punkte i.d.R. kein SN_L-Feld besitzen).
-function findBundeslandForPoint(lon, lat, polygonFeatures) {
+// Nutzt den RBush-Index statt linear über alle Polygone zu iterieren
+function findBundeslandForPoint(lon, lat, polygonIndex) {
   const targetPoint = point([lon, lat]);
-  for (const feature of polygonFeatures) {
-    if (booleanPointInPolygon(targetPoint, feature)) {
-      return BUNDESLAND_MAP[feature.properties.SN_L] ?? null;
+  const candidates = polygonIndex.search({
+    minX: lon,
+    minY: lat,
+    maxX: lon,
+    maxY: lat,
+  });
+  for (const candidate of candidates) {
+    if (booleanPointInPolygon(targetPoint, candidate.feature)) {
+      return BUNDESLAND_MAP[candidate.feature.properties.SN_L] ?? null;
     }
   }
   return null;
@@ -132,12 +155,9 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { pointFeatures, polygonFeatures } = loadData();
+    const { pointFeatures, polygonFeatures, polygonIndex } = loadData();
     const normalizedQuery = normalize(query.trim());
 
-    // Point-Treffer finden und nach Wichtigkeit sortieren
-    // (place-Typ zuerst, dann Einwohnerzahl - damit "Berlin" die Hauptstadt
-    // liefert und nicht einen gleichnamigen Weiler)
     let pointMatches = findMatches(pointFeatures, normalizedQuery);
     pointMatches.sort((a, b) => {
       const rankDiff = placeRank(b.properties) - placeRank(a.properties);
@@ -145,12 +165,9 @@ export default async function handler(req, res) {
       return populationOf(b.properties) - populationOf(a.properties);
     });
 
-
-    const matchedNames = new Set(
-      pointMatches.map((f) => normalize(f.properties.name))
-    );
+    const matchedNames = new Set(pointMatches.map((f) => f._normalizedName));
     const polygonMatches = findMatches(polygonFeatures, normalizedQuery).filter(
-      (f) => !matchedNames.has(normalize(f.properties.name))
+      (f) => !matchedNames.has(f._normalizedName)
     );
 
     if (pointMatches.length === 0 && polygonMatches.length === 0) {
@@ -159,12 +176,11 @@ export default async function handler(req, res) {
 
     const results = [];
 
-    // Point-Treffer übernehmen (bereits der "echte" Mittelpunkt)
     for (const feature of pointMatches) {
       const [lon, lat] = feature.geometry.coordinates;
       const bundesland =
         BUNDESLAND_MAP[feature.properties.SN_L] ??
-        findBundeslandForPoint(lon, lat, polygonFeatures);
+        findBundeslandForPoint(lon, lat, polygonIndex);
 
       results.push({
         name: feature.properties.name,
@@ -182,7 +198,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // Polygon-Treffer: Punkt innerhalb der Fläche berechnen (statt reinem Zentroid)
     for (const feature of polygonMatches) {
       const p = pointOnFeature(feature);
       const [lon, lat] = p.geometry.coordinates;
