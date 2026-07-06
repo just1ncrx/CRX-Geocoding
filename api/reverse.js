@@ -1,28 +1,26 @@
 import fs from "fs";
 import path from "path";
-import { point } from "@turf/helpers";
-import booleanPointInPolygon from "@turf/boolean-point-in-polygon";
-import centroid from "@turf/centroid";
-import distance from "@turf/distance";
+import { point, featureCollection } from "@turf/helpers";
+import nearestPoint from "@turf/nearest-point";
 
-// GeoJSON nur einmal einlesen und im Modul-Scope cachen
-let germanyFeatures = null;
+// GeoJSON nur einmal einlesen und im Modul-Scope cachen,
+// damit nicht bei jedem Request die (potentiell große) Datei neu geparst wird.
+let germanyFC = null;
 
 function loadData() {
-  if (germanyFeatures) return germanyFeatures;
+  if (germanyFC) return germanyFC;
 
   const filePath = path.join(process.cwd(), "data", "deutschland.geojson");
   const raw = fs.readFileSync(filePath, "utf-8");
   const parsed = JSON.parse(raw);
 
-  // Nur Polygon/MultiPolygon-Features behalten (Verwaltungsgrenzen)
-  germanyFeatures = parsed.features.filter(
-    (f) =>
-      f.geometry &&
-      (f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon")
+  // Nur Point-Features behalten, falls die Datei auch andere Geometrien enthält
+  const points = parsed.features.filter(
+    (f) => f.geometry && f.geometry.type === "Point"
   );
 
-  return germanyFeatures;
+  germanyFC = featureCollection(points);
+  return germanyFC;
 }
 
 export default async function handler(req, res) {
@@ -56,53 +54,30 @@ export default async function handler(req, res) {
   }
 
   try {
-    const features = loadData();
+    const fc = loadData();
     const targetPoint = point([longitudeNum, latitude]);
 
-    // 1. Exakte Prüfung: liegt der Punkt in einem der Polygone?
-    let match = null;
-    for (const feature of features) {
-      if (booleanPointInPolygon(targetPoint, feature)) {
-        match = feature;
-        break;
-      }
-    }
+    const nearest = nearestPoint(targetPoint, fc);
 
-    // 2. Fallback: falls kein Treffer (z. B. Punkt knapp außerhalb / auf See),
-    //    nächstgelegenes Polygon anhand des Zentroid-Abstands finden.
-    let distanceKm = 0;
-    if (!match) {
-      let bestDist = Infinity;
-      for (const feature of features) {
-        const c = centroid(feature);
-        const d = distance(targetPoint, c, { units: "kilometers" });
-        if (d < bestDist) {
-          bestDist = d;
-          match = feature;
-        }
-      }
-      distanceKm = bestDist;
-    }
-
-    if (!match) {
+    if (!nearest) {
       return res.status(404).json({ error: "Kein Treffer gefunden." });
     }
 
-    const p = match.properties;
+    const distanceKm = nearest.properties.distanceToPoint; // von turf gesetzt
 
     return res.status(200).json({
       query: { lat: latitude, lon: longitudeNum },
       result: {
-        name: p.name ?? null,
-        bez: p.BEZ ?? null, // z.B. "Gemeinschaftsfreie Gemeinde"
-        ars: p.ARS ?? null, // Amtlicher Regionalschlüssel
-        ags: p.AGS ?? null, // Amtlicher Gemeindeschlüssel
-        nuts: p.NUTS ?? null,
-        bundesland_code: p.SN_L ?? null,
-        exact_match: distanceKm === 0,
-        distance_km: distanceKm > 0 ? Number(distanceKm.toFixed(3)) : 0,
+        name: nearest.properties.name ?? null,
+        place: nearest.properties.place ?? null,
+        postal_code: nearest.properties.postal_code ?? null,
+        population: nearest.properties.population ?? null,
+        wikidata: nearest.properties.wikidata ?? null,
+        wikipedia: nearest.properties.wikipedia ?? null,
+        coordinates: nearest.geometry.coordinates,
+        distance_km: distanceKm,
       },
-      raw: match,
+      raw: nearest,
     });
   } catch (err) {
     console.error("Reverse-Geocoding-Fehler:", err);
