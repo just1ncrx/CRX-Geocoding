@@ -2,12 +2,12 @@
   "name": "reverse-geocoding-api",
   "version": "1.0.0",
   "description": "Reverse Geocoding API für Deutschland auf Basis von GeoJSON und turf.js",
-"dependencies": {
+  "dependencies": {
     "@turf/helpers": "^7.1.0",
-    "@turf/nearest-point": "^7.1.0",
     "@turf/boolean-point-in-polygon": "^7.1.0",
     "@turf/centroid": "^7.1.0",
     "@turf/distance": "^7.1.0",
+    "@turf/point-on-feature": "^7.1.0",
     "next": "^14.2.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0"
