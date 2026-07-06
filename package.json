@@ -1,7 +1,6 @@
 {
   "name": "reverse-geocoding-api",
   "version": "1.0.0",
-  "private": true,
   "description": "Reverse Geocoding API für Deutschland auf Basis von GeoJSON und turf.js",
 "dependencies": {
   "@turf/helpers": "^7.1.0",
