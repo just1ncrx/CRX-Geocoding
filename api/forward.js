@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import centroid from "@turf/centroid";
+import pointOnFeature from "@turf/point-on-feature";
 
 const BUNDESLAND_MAP = {
   "01": "Schleswig-Holstein",
@@ -21,24 +21,31 @@ const BUNDESLAND_MAP = {
   "16": "Thüringen",
 };
 
-let germanyFeatures = null;
+// Getrennte Caches für Points (echte Ortsmittelpunkte) und Polygone (Gemeindegrenzen)
+let pointFeatures = null;
+let polygonFeatures = null;
 
 function loadData() {
-  if (germanyFeatures) return germanyFeatures;
+  if (pointFeatures && polygonFeatures) {
+    return { pointFeatures, polygonFeatures };
+  }
 
   const filePath = path.join(process.cwd(), "data", "deutschland.geojson");
   const raw = fs.readFileSync(filePath, "utf-8");
   const parsed = JSON.parse(raw);
 
-  germanyFeatures = parsed.features.filter(
+  pointFeatures = parsed.features.filter(
+    (f) => f.geometry && f.geometry.type === "Point" && f.properties?.name
+  );
+
+  polygonFeatures = parsed.features.filter(
     (f) =>
       f.geometry &&
       (f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon") &&
-      f.properties &&
-      f.properties.name
+      f.properties?.name
   );
 
-  return germanyFeatures;
+  return { pointFeatures, polygonFeatures };
 }
 
 function normalize(str) {
@@ -46,6 +53,26 @@ function normalize(str) {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, ""); // Umlaute/Akzente für Vergleich entfernen
+}
+
+function findMatches(features, normalizedQuery) {
+  // 1. Exakte Treffer (normalisiert)
+  let matches = features.filter(
+    (f) => normalize(f.properties.name) === normalizedQuery
+  );
+  // 2. "beginnt mit"
+  if (matches.length === 0) {
+    matches = features.filter((f) =>
+      normalize(f.properties.name).startsWith(normalizedQuery)
+    );
+  }
+  // 3. "enthält"
+  if (matches.length === 0) {
+    matches = features.filter((f) =>
+      normalize(f.properties.name).includes(normalizedQuery)
+    );
+  }
+  return matches;
 }
 
 export default async function handler(req, res) {
@@ -69,38 +96,35 @@ export default async function handler(req, res) {
   }
 
   try {
-    const features = loadData();
+    const { pointFeatures, polygonFeatures } = loadData();
     const normalizedQuery = normalize(query.trim());
 
-    // 1. Exakte Treffer (normalisiert)
-    let matches = features.filter(
-      (f) => normalize(f.properties.name) === normalizedQuery
+    // Zuerst in den Point-Features suchen (echte Ortsmittelpunkte, am genauesten)
+    const pointMatches = findMatches(pointFeatures, normalizedQuery);
+
+    // Zusätzlich Polygon-Namen sammeln, die noch NICHT über einen Point abgedeckt sind
+    const matchedNames = new Set(
+      pointMatches.map((f) => normalize(f.properties.name))
+    );
+    const polygonMatches = findMatches(polygonFeatures, normalizedQuery).filter(
+      (f) => !matchedNames.has(normalize(f.properties.name))
     );
 
-    // 2. Falls kein exakter Treffer: "beginnt mit"
-    if (matches.length === 0) {
-      matches = features.filter((f) =>
-        normalize(f.properties.name).startsWith(normalizedQuery)
-      );
-    }
-
-    // 3. Falls immer noch nichts: "enthält"
-    if (matches.length === 0) {
-      matches = features.filter((f) =>
-        normalize(f.properties.name).includes(normalizedQuery)
-      );
-    }
-
-    if (matches.length === 0) {
+    if (pointMatches.length === 0 && polygonMatches.length === 0) {
       return res.status(404).json({ error: "Kein Ort gefunden.", query });
     }
 
-    const results = matches.slice(0, maxResults).map((feature) => {
-      const c = centroid(feature);
-      const [lon, lat] = c.geometry.coordinates;
-      const bundesland = BUNDESLAND_MAP[feature.properties.SN_L] ?? null;
+    const results = [];
 
-      return {
+    // Point-Treffer direkt übernehmen (bereits der "echte" Mittelpunkt)
+    for (const feature of pointMatches) {
+      const [lon, lat] = feature.geometry.coordinates;
+      const bundesland =
+        BUNDESLAND_MAP[feature.properties.SN_L] ??
+        feature.properties.bundesland ??
+        null;
+
+      results.push({
         name: feature.properties.name,
         lat,
         lon,
@@ -113,10 +137,32 @@ export default async function handler(req, res) {
         population: feature.properties.population
           ? parseInt(feature.properties.population)
           : 0,
-      };
-    });
+        source: "point",
+      });
+    }
 
-    return res.status(200).json(results);
+    // Polygon-Treffer: Punkt innerhalb der Fläche berechnen (statt reinem Zentroid)
+    for (const feature of polygonMatches) {
+      const p = pointOnFeature(feature);
+      const [lon, lat] = p.geometry.coordinates;
+      const bundesland = BUNDESLAND_MAP[feature.properties.SN_L] ?? null;
+
+      results.push({
+        name: feature.properties.name,
+        lat,
+        lon,
+        latitude: lat,
+        longitude: lon,
+        admin1: bundesland,
+        bundesland,
+        country: "Deutschland",
+        country_code: "de",
+        population: 0,
+        source: "polygon",
+      });
+    }
+
+    return res.status(200).json(results.slice(0, maxResults));
   } catch (err) {
     console.error("Forward-Geocoding-Fehler:", err);
     return res.status(500).json({ error: "Interner Serverfehler." });
