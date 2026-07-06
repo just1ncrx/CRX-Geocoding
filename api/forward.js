@@ -1,6 +1,8 @@
 import fs from "fs";
 import path from "path";
 import pointOnFeature from "@turf/point-on-feature";
+import booleanPointInPolygon from "@turf/boolean-point-in-polygon";
+import { point } from "@turf/helpers";
 
 const BUNDESLAND_MAP = {
   "01": "Schleswig-Holstein",
@@ -20,6 +22,28 @@ const BUNDESLAND_MAP = {
   "15": "Sachsen-Anhalt",
   "16": "Thüringen",
 };
+
+// Wichtigkeit von OSM "place"-Tags, um bei mehreren gleichnamigen Treffern
+// den richtigen (z.B. die Großstadt statt einen Weiler) zu bevorzugen.
+const PLACE_RANK = {
+  city: 7,
+  town: 6,
+  municipality: 5,
+  borough: 4,
+  suburb: 3,
+  village: 2,
+  hamlet: 1,
+  isolated_dwelling: 0,
+};
+
+function placeRank(props) {
+  return PLACE_RANK[props?.place] ?? 0;
+}
+
+function populationOf(props) {
+  const n = parseInt(props?.population);
+  return Number.isNaN(n) ? 0 : n;
+}
 
 // Getrennte Caches für Points (echte Ortsmittelpunkte) und Polygone (Gemeindegrenzen)
 let pointFeatures = null;
@@ -75,6 +99,18 @@ function findMatches(features, normalizedQuery) {
   return matches;
 }
 
+// Findet das Bundesland eines Punkts per Point-in-Polygon-Check gegen die
+// Gemeindegrenzen (nötig, da OSM-Punkte i.d.R. kein SN_L-Feld besitzen).
+function findBundeslandForPoint(lon, lat, polygonFeatures) {
+  const targetPoint = point([lon, lat]);
+  for (const feature of polygonFeatures) {
+    if (booleanPointInPolygon(targetPoint, feature)) {
+      return BUNDESLAND_MAP[feature.properties.SN_L] ?? null;
+    }
+  }
+  return null;
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
@@ -99,10 +135,17 @@ export default async function handler(req, res) {
     const { pointFeatures, polygonFeatures } = loadData();
     const normalizedQuery = normalize(query.trim());
 
-    // Zuerst in den Point-Features suchen (echte Ortsmittelpunkte, am genauesten)
-    const pointMatches = findMatches(pointFeatures, normalizedQuery);
+    // Point-Treffer finden und nach Wichtigkeit sortieren
+    // (place-Typ zuerst, dann Einwohnerzahl - damit "Berlin" die Hauptstadt
+    // liefert und nicht einen gleichnamigen Weiler)
+    let pointMatches = findMatches(pointFeatures, normalizedQuery);
+    pointMatches.sort((a, b) => {
+      const rankDiff = placeRank(b.properties) - placeRank(a.properties);
+      if (rankDiff !== 0) return rankDiff;
+      return populationOf(b.properties) - populationOf(a.properties);
+    });
 
-    // Zusätzlich Polygon-Namen sammeln, die noch NICHT über einen Point abgedeckt sind
+    // Polygon-Namen, die schon über einen (wichtigeren) Point abgedeckt sind, ausschließen
     const matchedNames = new Set(
       pointMatches.map((f) => normalize(f.properties.name))
     );
@@ -116,13 +159,12 @@ export default async function handler(req, res) {
 
     const results = [];
 
-    // Point-Treffer direkt übernehmen (bereits der "echte" Mittelpunkt)
+    // Point-Treffer übernehmen (bereits der "echte" Mittelpunkt)
     for (const feature of pointMatches) {
       const [lon, lat] = feature.geometry.coordinates;
       const bundesland =
         BUNDESLAND_MAP[feature.properties.SN_L] ??
-        feature.properties.bundesland ??
-        null;
+        findBundeslandForPoint(lon, lat, polygonFeatures);
 
       results.push({
         name: feature.properties.name,
@@ -134,9 +176,8 @@ export default async function handler(req, res) {
         bundesland,
         country: "Deutschland",
         country_code: "de",
-        population: feature.properties.population
-          ? parseInt(feature.properties.population)
-          : 0,
+        population: populationOf(feature.properties),
+        place: feature.properties.place ?? null,
         source: "point",
       });
     }
@@ -158,6 +199,7 @@ export default async function handler(req, res) {
         country: "Deutschland",
         country_code: "de",
         population: 0,
+        place: null,
         source: "polygon",
       });
     }
