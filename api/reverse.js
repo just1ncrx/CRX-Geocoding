@@ -1,26 +1,48 @@
 import fs from "fs";
 import path from "path";
-import { point, featureCollection } from "@turf/helpers";
-import nearestPoint from "@turf/nearest-point";
+import { point } from "@turf/helpers";
+import booleanPointInPolygon from "@turf/boolean-point-in-polygon";
+import centroid from "@turf/centroid";
+import distance from "@turf/distance";
 
-// GeoJSON nur einmal einlesen und im Modul-Scope cachen,
-// damit nicht bei jedem Request die (potentiell große) Datei neu geparst wird.
-let germanyFC = null;
+// Amtlicher Ländercode (SN_L / erste 2 Ziffern von ARS/AGS) -> Bundesland-Name
+const BUNDESLAND_MAP = {
+  "01": "Schleswig-Holstein",
+  "02": "Hamburg",
+  "03": "Niedersachsen",
+  "04": "Bremen",
+  "05": "Nordrhein-Westfalen",
+  "06": "Hessen",
+  "07": "Rheinland-Pfalz",
+  "08": "Baden-Württemberg",
+  "09": "Bayern",
+  "10": "Saarland",
+  "11": "Berlin",
+  "12": "Brandenburg",
+  "13": "Mecklenburg-Vorpommern",
+  "14": "Sachsen",
+  "15": "Sachsen-Anhalt",
+  "16": "Thüringen",
+};
+
+// GeoJSON nur einmal einlesen und im Modul-Scope cachen
+let germanyFeatures = null;
 
 function loadData() {
-  if (germanyFC) return germanyFC;
+  if (germanyFeatures) return germanyFeatures;
 
   const filePath = path.join(process.cwd(), "data", "deutschland.geojson");
   const raw = fs.readFileSync(filePath, "utf-8");
   const parsed = JSON.parse(raw);
 
-  // Nur Point-Features behalten, falls die Datei auch andere Geometrien enthält
-  const points = parsed.features.filter(
-    (f) => f.geometry && f.geometry.type === "Point"
+  // Nur Polygon/MultiPolygon-Features behalten (Verwaltungsgrenzen)
+  germanyFeatures = parsed.features.filter(
+    (f) =>
+      f.geometry &&
+      (f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon")
   );
 
-  germanyFC = featureCollection(points);
-  return germanyFC;
+  return germanyFeatures;
 }
 
 export default async function handler(req, res) {
@@ -54,30 +76,43 @@ export default async function handler(req, res) {
   }
 
   try {
-    const fc = loadData();
+    const features = loadData();
     const targetPoint = point([longitudeNum, latitude]);
 
-    const nearest = nearestPoint(targetPoint, fc);
+    // 1. Exakte Prüfung: liegt der Punkt in einem der Polygone?
+    let match = null;
+    for (const feature of features) {
+      if (booleanPointInPolygon(targetPoint, feature)) {
+        match = feature;
+        break;
+      }
+    }
 
-    if (!nearest) {
+    // 2. Fallback: nächstgelegenes Polygon anhand des Zentroid-Abstands
+    if (!match) {
+      let bestDist = Infinity;
+      for (const feature of features) {
+        const c = centroid(feature);
+        const d = distance(targetPoint, c, { units: "kilometers" });
+        if (d < bestDist) {
+          bestDist = d;
+          match = feature;
+        }
+      }
+    }
+
+    if (!match) {
       return res.status(404).json({ error: "Kein Treffer gefunden." });
     }
 
-    const distanceKm = nearest.properties.distanceToPoint; // von turf gesetzt
+    const p = match.properties;
+    const bundesland = BUNDESLAND_MAP[p.SN_L] ?? null;
 
     return res.status(200).json({
-      query: { lat: latitude, lon: longitudeNum },
-      result: {
-        name: nearest.properties.name ?? null,
-        place: nearest.properties.place ?? null,
-        postal_code: nearest.properties.postal_code ?? null,
-        population: nearest.properties.population ?? null,
-        wikidata: nearest.properties.wikidata ?? null,
-        wikipedia: nearest.properties.wikipedia ?? null,
-        coordinates: nearest.geometry.coordinates,
-        distance_km: distanceKm,
-      },
-      raw: nearest,
+      lat: latitude,
+      lon: longitudeNum,
+      name: p.name ?? null,
+      bundesland,
     });
   } catch (err) {
     console.error("Reverse-Geocoding-Fehler:", err);
