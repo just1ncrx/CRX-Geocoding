@@ -104,7 +104,15 @@ export default async function handler(req, res) {
         name: feature.properties.name,
         lat,
         lon,
+        latitude: lat,
+        longitude: lon,
+        admin1: bundesland,
         bundesland,
+        country: "Deutschland",
+        country_code: "de",
+        population: feature.properties.population
+          ? parseInt(feature.properties.population)
+          : 0,
       };
     });
 
