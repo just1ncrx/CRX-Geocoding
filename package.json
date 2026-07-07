@@ -11,10 +11,9 @@
     "next": "^14.2.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0"
-  }
+  },
   "scripts": {
     "build-index": "node scripts/build-index.mjs",
     "build": "npm run build-index && next build"
   }
-}
 }
