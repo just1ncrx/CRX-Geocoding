@@ -2,80 +2,49 @@ import fs from "fs";
 import path from "path";
 import { point } from "@turf/helpers";
 import booleanPointInPolygon from "@turf/boolean-point-in-polygon";
-import bbox from "@turf/bbox";
 import RBush from "rbush";
 
 const BUNDESLAND_MAP = {
-  "01": "Schleswig-Holstein",
-  "02": "Hamburg",
-  "03": "Niedersachsen",
-  "04": "Bremen",
-  "05": "Nordrhein-Westfalen",
-  "06": "Hessen",
-  "07": "Rheinland-Pfalz",
-  "08": "Baden-Württemberg",
-  "09": "Bayern",
-  "10": "Saarland",
-  "11": "Berlin",
-  "12": "Brandenburg",
-  "13": "Mecklenburg-Vorpommern",
-  "14": "Sachsen",
-  "15": "Sachsen-Anhalt",
+  "01": "Schleswig-Holstein", "02": "Hamburg", "03": "Niedersachsen",
+  "04": "Bremen", "05": "Nordrhein-Westfalen", "06": "Hessen",
+  "07": "Rheinland-Pfalz", "08": "Baden-Württemberg", "09": "Bayern",
+  "10": "Saarland", "11": "Berlin", "12": "Brandenburg",
+  "13": "Mecklenburg-Vorpommern", "14": "Sachsen", "15": "Sachsen-Anhalt",
   "16": "Thüringen",
 };
 
-// Modul-Scope-Cache (gilt pro warmer Serverless-Instanz)
-let polygonIndex = null;   // RBush über BBoxen der Polygone (für Enthalten-Test)
+let polygonIndex = null;
 
-// Einfacher LRU-artiger Ergebnis-Cache (viele Anfragen häufen sich auf denselben Ort)
 const CACHE_MAX_ENTRIES = 5000;
 const resultCache = new Map();
 
 function cacheKey(lat, lon) {
-  // ~100m Rundung reicht für Bundesland/Gemeinde-Zuordnung völlig aus
-  // und sorgt dafür, dass nahegelegene Punkte denselben Cache-Eintrag treffen.
   return lat.toFixed(3) + "," + lon.toFixed(3);
 }
-
 function cacheGet(key) {
   if (!resultCache.has(key)) return undefined;
   const value = resultCache.get(key);
-  // Re-insert für LRU-Reihenfolge (Map behält Insertion-Order)
   resultCache.delete(key);
   resultCache.set(key, value);
   return value;
 }
-
 function cacheSet(key, value) {
   if (resultCache.size >= CACHE_MAX_ENTRIES) {
-    const oldestKey = resultCache.keys().next().value;
-    resultCache.delete(oldestKey);
+    resultCache.delete(resultCache.keys().next().value);
   }
   resultCache.set(key, value);
 }
 
 function loadData() {
-  if (polygonIndex) {
-    return { polygonIndex };
-  }
+  if (polygonIndex) return { polygonIndex };
 
-  const filePath = path.join(process.cwd(), "data", "deutschland.geojson");
+  // Liest jetzt die vorberechnete, schlanke Indexdatei statt Rohdaten zu parsen
+  const filePath = path.join(process.cwd(), "data", "deutschland.index.json");
   const raw = fs.readFileSync(filePath, "utf-8");
-  const parsed = JSON.parse(raw);
-
-  const features = parsed.features.filter(
-    (f) =>
-      f.geometry &&
-      (f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon")
-  );
-
-  const polygonItems = features.map((feature) => {
-    const [minX, minY, maxX, maxY] = bbox(feature);
-    return { minX, minY, maxX, maxY, feature };
-  });
+  const { items } = JSON.parse(raw);
 
   polygonIndex = new RBush();
-  polygonIndex.load(polygonItems);
+  polygonIndex.load(items); // items enthalten schon minX/minY/maxX/maxY
 
   return { polygonIndex };
 }
@@ -116,7 +85,6 @@ export default async function handler(req, res) {
     const { polygonIndex } = loadData();
     const targetPoint = point([longitudeNum, latitude]);
 
-    // 1. Nur Kandidaten aus dem R-Tree holen, deren BBox den Punkt enthält
     const candidates = polygonIndex.search({
       minX: longitudeNum,
       minY: latitude,
@@ -147,7 +115,6 @@ export default async function handler(req, res) {
     };
 
     cacheSet(key, responseBody);
-
     return res.status(200).json(responseBody);
   } catch (err) {
     console.error("Reverse-Geocoding-Fehler:", err);
