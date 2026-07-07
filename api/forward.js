@@ -1,29 +1,79 @@
+// api/geocode.js
+//
+// Voraussetzung: einmal lokal ausführen
+//   node scripts/build-search-index.mjs
+// erzeugt data/search-index.json, das diese Datei lädt.
+//
+// Kein turf, kein RBush, keine Geometrie-Verarbeitung mehr zur Laufzeit -
+// dadurch ist auch der Cold Start deutlich schneller als vorher.
+
 import fs from "fs";
 import path from "path";
-import pointOnFeature from "@turf/point-on-feature";
-import booleanPointInPolygon from "@turf/boolean-point-in-polygon";
-import bbox from "@turf/bbox";
-import { point } from "@turf/helpers";
-import RBush from "rbush";
 
-const BUNDESLAND_MAP = {
-  "01": "Schleswig-Holstein",
-  "02": "Hamburg",
-  "03": "Niedersachsen",
-  "04": "Bremen",
-  "05": "Nordrhein-Westfalen",
-  "06": "Hessen",
-  "07": "Rheinland-Pfalz",
-  "08": "Baden-Württemberg",
-  "09": "Bayern",
-  "10": "Saarland",
-  "11": "Berlin",
-  "12": "Brandenburg",
-  "13": "Mecklenburg-Vorpommern",
-  "14": "Sachsen",
-  "15": "Sachsen-Anhalt",
-  "16": "Thüringen",
-};
+let exactMap = null;    // normalizedName -> entry[]
+let sortedEntries = null; // bereits sortiert aus dem Build-Script
+
+function loadData() {
+  if (exactMap && sortedEntries) {
+    return { exactMap, sortedEntries };
+  }
+
+  const filePath = path.join(process.cwd(), "data", "search-index.json");
+  const raw = fs.readFileSync(filePath, "utf-8");
+  sortedEntries = JSON.parse(raw); // bereits sortiert, kein .sort() nötig
+
+  exactMap = new Map();
+  for (const entry of sortedEntries) {
+    if (!exactMap.has(entry.normalizedName)) {
+      exactMap.set(entry.normalizedName, []);
+    }
+    exactMap.get(entry.normalizedName).push(entry);
+  }
+
+  return { exactMap, sortedEntries };
+}
+
+function normalize(str) {
+  return str
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+// Findet den ersten Index, ab dem entry.normalizedName >= prefix
+function lowerBound(arr, prefix) {
+  let lo = 0,
+    hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (arr[mid].normalizedName < prefix) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function prefixSearch(sortedEntries, prefix) {
+  const start = lowerBound(sortedEntries, prefix);
+  const results = [];
+  for (let i = start; i < sortedEntries.length; i++) {
+    if (!sortedEntries[i].normalizedName.startsWith(prefix)) break;
+    results.push(sortedEntries[i]);
+  }
+  return results;
+}
+
+function findMatches(normalizedQuery, exactMap, sortedEntries) {
+  const exact = exactMap.get(normalizedQuery);
+  if (exact && exact.length > 0) return exact;
+
+  const prefixMatches = prefixSearch(sortedEntries, normalizedQuery);
+  if (prefixMatches.length > 0) return prefixMatches;
+
+  // Fallback: Substring-Suche, nur wenn nötig (selten der Fall)
+  return sortedEntries.filter((e) =>
+    e.normalizedName.includes(normalizedQuery)
+  );
+}
 
 const PLACE_RANK = {
   city: 7,
@@ -36,102 +86,8 @@ const PLACE_RANK = {
   isolated_dwelling: 0,
 };
 
-function placeRank(props) {
-  return PLACE_RANK[props?.place] ?? 0;
-}
-
-function populationOf(props) {
-  const n = parseInt(props?.population);
-  return Number.isNaN(n) ? 0 : n;
-}
-
-function normalize(str) {
-  return str
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
-}
-
-// Caches: Point-/Polygon-Features (mit vorab normalisiertem Namen)
-// + RBush-Index über die Polygon-BBoxen für schnelle Bundesland-Lookups
-let pointFeatures = null;
-let polygonFeatures = null;
-let polygonIndex = null;
-let polygonItems = null;
-
-function loadData() {
-  if (pointFeatures && polygonFeatures) {
-    return { pointFeatures, polygonFeatures, polygonIndex, polygonItems };
-  }
-
-  const filePath = path.join(process.cwd(), "data", "deutschland.geojson");
-  const raw = fs.readFileSync(filePath, "utf-8");
-  const parsed = JSON.parse(raw);
-
-  pointFeatures = parsed.features
-    .filter(
-      (f) => f.geometry && f.geometry.type === "Point" && f.properties?.name
-    )
-    // normalisierten Namen einmalig berechnen statt bei jedem Request
-    .map((f) => {
-      f._normalizedName = normalize(f.properties.name);
-      return f;
-    });
-
-  polygonFeatures = parsed.features
-    .filter(
-      (f) =>
-        f.geometry &&
-        (f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon") &&
-        f.properties?.name
-    )
-    .map((f) => {
-      f._normalizedName = normalize(f.properties.name);
-      return f;
-    });
-
-  // RBush-Index für schnelle Point-in-Polygon-Kandidatensuche
-  polygonItems = polygonFeatures.map((feature) => {
-    const [minX, minY, maxX, maxY] = bbox(feature);
-    return { minX, minY, maxX, maxY, feature };
-  });
-  polygonIndex = new RBush();
-  polygonIndex.load(polygonItems);
-
-  return { pointFeatures, polygonFeatures, polygonIndex, polygonItems };
-}
-
-function findMatches(features, normalizedQuery) {
-  // Nutzt jetzt f._normalizedName (vorberechnet) statt normalize(f.properties.name)
-  let matches = features.filter((f) => f._normalizedName === normalizedQuery);
-  if (matches.length === 0) {
-    matches = features.filter((f) =>
-      f._normalizedName.startsWith(normalizedQuery)
-    );
-  }
-  if (matches.length === 0) {
-    matches = features.filter((f) =>
-      f._normalizedName.includes(normalizedQuery)
-    );
-  }
-  return matches;
-}
-
-// Nutzt den RBush-Index statt linear über alle Polygone zu iterieren
-function findBundeslandForPoint(lon, lat, polygonIndex) {
-  const targetPoint = point([lon, lat]);
-  const candidates = polygonIndex.search({
-    minX: lon,
-    minY: lat,
-    maxX: lon,
-    maxY: lat,
-  });
-  for (const candidate of candidates) {
-    if (booleanPointInPolygon(targetPoint, candidate.feature)) {
-      return BUNDESLAND_MAP[candidate.feature.properties.SN_L] ?? null;
-    }
-  }
-  return null;
+function placeRank(entry) {
+  return PLACE_RANK[entry.place] ?? 0;
 }
 
 export default async function handler(req, res) {
@@ -155,71 +111,41 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { pointFeatures, polygonFeatures, polygonIndex } = loadData();
+    const { exactMap, sortedEntries } = loadData();
     const normalizedQuery = normalize(query.trim());
 
-    let pointMatches = findMatches(pointFeatures, normalizedQuery);
-    pointMatches.sort((a, b) => {
-      const rankDiff = placeRank(b.properties) - placeRank(a.properties);
-      if (rankDiff !== 0) return rankDiff;
-      return populationOf(b.properties) - populationOf(a.properties);
-    });
+    const matches = findMatches(normalizedQuery, exactMap, sortedEntries);
 
-    const matchedNames = new Set(pointMatches.map((f) => f._normalizedName));
-    const polygonMatches = findMatches(polygonFeatures, normalizedQuery).filter(
-      (f) => !matchedNames.has(f._normalizedName)
-    );
-
-    if (pointMatches.length === 0 && polygonMatches.length === 0) {
+    if (matches.length === 0) {
       return res.status(404).json({ error: "Kein Ort gefunden.", query });
     }
 
-    const results = [];
+    // Punkte vor Polygonen, dann nach Place-Rang, dann nach Bevölkerung
+    matches.sort((a, b) => {
+      if (a.source !== b.source) {
+        return a.source === "point" ? -1 : 1;
+      }
+      const rankDiff = placeRank(b) - placeRank(a);
+      if (rankDiff !== 0) return rankDiff;
+      return b.population - a.population;
+    });
 
-    for (const feature of pointMatches) {
-      const [lon, lat] = feature.geometry.coordinates;
-      const bundesland =
-        BUNDESLAND_MAP[feature.properties.SN_L] ??
-        findBundeslandForPoint(lon, lat, polygonIndex);
+    const results = matches.slice(0, maxResults).map((entry) => ({
+      name: entry.name,
+      lat: entry.lat,
+      lon: entry.lon,
+      latitude: entry.lat,
+      longitude: entry.lon,
+      admin1: entry.bundesland,
+      bundesland: entry.bundesland,
+      country: "Deutschland",
+      country_code: "de",
+      population: entry.population,
+      place: entry.place,
+      source: entry.source,
+    }));
 
-      results.push({
-        name: feature.properties.name,
-        lat,
-        lon,
-        latitude: lat,
-        longitude: lon,
-        admin1: bundesland,
-        bundesland,
-        country: "Deutschland",
-        country_code: "de",
-        population: populationOf(feature.properties),
-        place: feature.properties.place ?? null,
-        source: "point",
-      });
-    }
-
-    for (const feature of polygonMatches) {
-      const p = pointOnFeature(feature);
-      const [lon, lat] = p.geometry.coordinates;
-      const bundesland = BUNDESLAND_MAP[feature.properties.SN_L] ?? null;
-
-      results.push({
-        name: feature.properties.name,
-        lat,
-        lon,
-        latitude: lat,
-        longitude: lon,
-        admin1: bundesland,
-        bundesland,
-        country: "Deutschland",
-        country_code: "de",
-        population: 0,
-        place: null,
-        source: "polygon",
-      });
-    }
-
-    return res.status(200).json(results.slice(0, maxResults));
+    return res.status(200).json(results);
   } catch (err) {
     console.error("Forward-Geocoding-Fehler:", err);
     return res.status(500).json({ error: "Interner Serverfehler." });
