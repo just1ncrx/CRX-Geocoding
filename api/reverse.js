@@ -2,9 +2,7 @@ import fs from "fs";
 import path from "path";
 import { point } from "@turf/helpers";
 import booleanPointInPolygon from "@turf/boolean-point-in-polygon";
-import centroid from "@turf/centroid";
 import bbox from "@turf/bbox";
-import distance from "@turf/distance";
 import RBush from "rbush";
 
 const BUNDESLAND_MAP = {
@@ -27,11 +25,39 @@ const BUNDESLAND_MAP = {
 };
 
 // Modul-Scope-Cache (gilt pro warmer Serverless-Instanz)
-let index = null;      // RBush-Index über BBoxen
-let items = null;      // { minX, minY, maxX, maxY, feature, centroid } je Feature
+let polygonIndex = null;   // RBush über BBoxen der Polygone (für Enthalten-Test)
+
+// Einfacher LRU-artiger Ergebnis-Cache (viele Anfragen häufen sich auf denselben Ort)
+const CACHE_MAX_ENTRIES = 5000;
+const resultCache = new Map();
+
+function cacheKey(lat, lon) {
+  // ~100m Rundung reicht für Bundesland/Gemeinde-Zuordnung völlig aus
+  // und sorgt dafür, dass nahegelegene Punkte denselben Cache-Eintrag treffen.
+  return lat.toFixed(3) + "," + lon.toFixed(3);
+}
+
+function cacheGet(key) {
+  if (!resultCache.has(key)) return undefined;
+  const value = resultCache.get(key);
+  // Re-insert für LRU-Reihenfolge (Map behält Insertion-Order)
+  resultCache.delete(key);
+  resultCache.set(key, value);
+  return value;
+}
+
+function cacheSet(key, value) {
+  if (resultCache.size >= CACHE_MAX_ENTRIES) {
+    const oldestKey = resultCache.keys().next().value;
+    resultCache.delete(oldestKey);
+  }
+  resultCache.set(key, value);
+}
 
 function loadData() {
-  if (index) return { index, items };
+  if (polygonIndex) {
+    return { polygonIndex };
+  }
 
   const filePath = path.join(process.cwd(), "data", "deutschland.geojson");
   const raw = fs.readFileSync(filePath, "utf-8");
@@ -43,23 +69,15 @@ function loadData() {
       (f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon")
   );
 
-  // Für jedes Feature BBox + Centroid einmalig vorberechnen
-  items = features.map((feature) => {
+  const polygonItems = features.map((feature) => {
     const [minX, minY, maxX, maxY] = bbox(feature);
-    return {
-      minX,
-      minY,
-      maxX,
-      maxY,
-      feature,
-      centroidCoord: centroid(feature).geometry.coordinates,
-    };
+    return { minX, minY, maxX, maxY, feature };
   });
 
-  index = new RBush();
-  index.load(items);
+  polygonIndex = new RBush();
+  polygonIndex.load(polygonItems);
 
-  return { index, items };
+  return { polygonIndex };
 }
 
 export default async function handler(req, res) {
@@ -88,12 +106,18 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "lat/lon außerhalb des gültigen Bereichs." });
   }
 
+  const key = cacheKey(latitude, longitudeNum);
+  const cached = cacheGet(key);
+  if (cached) {
+    return res.status(200).json(cached);
+  }
+
   try {
-    const { index, items } = loadData();
+    const { polygonIndex } = loadData();
     const targetPoint = point([longitudeNum, latitude]);
 
     // 1. Nur Kandidaten aus dem R-Tree holen, deren BBox den Punkt enthält
-    const candidates = index.search({
+    const candidates = polygonIndex.search({
       minX: longitudeNum,
       minY: latitude,
       maxX: longitudeNum,
@@ -108,22 +132,6 @@ export default async function handler(req, res) {
       }
     }
 
-    // 2. Fallback: nächstgelegenes Feature per vorab berechnetem Centroid
-    if (!match) {
-      let bestDist = Infinity;
-      for (const item of items) {
-        const d = distance(
-          targetPoint,
-          point(item.centroidCoord),
-          { units: "kilometers" }
-        );
-        if (d < bestDist) {
-          bestDist = d;
-          match = item.feature;
-        }
-      }
-    }
-
     if (!match) {
       return res.status(404).json({ error: "Kein Treffer gefunden." });
     }
@@ -131,12 +139,16 @@ export default async function handler(req, res) {
     const p = match.properties;
     const bundesland = BUNDESLAND_MAP[p.SN_L] ?? null;
 
-    return res.status(200).json({
+    const responseBody = {
       lat: latitude,
       lon: longitudeNum,
       name: p.name ?? null,
       bundesland,
-    });
+    };
+
+    cacheSet(key, responseBody);
+
+    return res.status(200).json(responseBody);
   } catch (err) {
     console.error("Reverse-Geocoding-Fehler:", err);
     return res.status(500).json({ error: "Interner Serverfehler." });
