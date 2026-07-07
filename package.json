@@ -6,14 +6,10 @@
     "@turf/helpers": "^7.1.0",
     "@turf/boolean-point-in-polygon": "^7.1.0",
     "@turf/bbox": "^7.1.0",
-    "@turf/point-on-feature": "^7.1.0",
-    "rbush": "^3.0.1",
-    "next": "^14.2.0",
-    "react": "^18.3.0",
-    "react-dom": "^18.3.0"
+    "rbush": "^3.0.1"
   },
   "scripts": {
     "build-index": "node scripts/build-index.mjs",
-    "build": "npm run build-index && next build"
+    "build": "npm run build-index"
   }
 }
