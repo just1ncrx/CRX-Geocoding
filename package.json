@@ -6,8 +6,6 @@
     "@turf/helpers": "^7.1.0",
     "@turf/boolean-point-in-polygon": "^7.1.0",
     "@turf/bbox": "^7.1.0",
-    "@turf/centroid": "^7.1.0",
-    "@turf/distance": "^7.1.0",
     "@turf/point-on-feature": "^7.1.0",
     "rbush": "^3.0.1",
     "next": "^14.2.0",
